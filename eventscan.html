@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EventScan — Contrôle d'accès</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script type="module">
+import { initializeApp }       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, doc, setDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy, serverTimestamp }
+                                from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged }
+                                from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const firebaseConfig = {
+  apiKey: "AIzaSyBdgBM7C_GBBr3ejD6uFo5Mv1oiKn1INPk",
+  authDomain: "evenscan-e04e6.firebaseapp.com",
+  projectId: "evenscan-e04e6",
+  storageBucket: "evenscan-e04e6.firebasestorage.app",
+  messagingSenderId: "1016339716152",
+  appId: "1:1016339716152:web:4fa1be132b746a1c242ecd"
+};
+
+// Liste des emails autorisés à accéder au dashboard
+// ⚠️ Ajoute ici les emails des admins autorisés
+const ADMIN_EMAILS = [
+  "ndawk5699@gmail.com"  // ← ton email principal
+];
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+const fbApp  = initializeApp(firebaseConfig);
+const db     = getFirestore(fbApp);
+const auth   = getAuth(fbApp);
+const gProvider = new GoogleAuthProvider();
+const ticketsCol = collection(db, 'tickets');
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let tickets       = [];
+let stats         = { ok: 0, fail: 0, total: 0 };
+let stream        = null, scanning = false, scanTimeout = null;
+let currentTicket = null;
+let emailProvider = 'resend';
+let unsubscribe   = null;
+let currentUser   = null;
+
+// ─── AUTH STATE ───────────────────────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  currentUser = user;
+  if (user) {
+    const allowed = ADMIN_EMAILS.map(e => e.toLowerCase()).includes(user.email.toLowerCase());
+    if (allowed) {
+      showAuthScreen(false);
+      updateUserUI(user);
+      initFirestore();
+    } else {
+      // Email non autorisé → déconnexion immédiate
+      signOut(auth);
+      showAuthScreen(true);
+      showAuthError('Accès refusé. Votre compte Google n\'est pas autorisé.');
+    }
+  } else {
+    showAuthScreen(true);
+    updateUserUI(null);
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  }
+});
+
+function showAuthScreen(show) {
+  document.getElementById('authOverlay').classList.toggle('open', show);
+  document.getElementById('mainApp').style.display = show ? 'none' : 'block';
+}
+function showAuthError(msg) {
+  const el = document.getElementById('authError');
+  el.textContent = msg; el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
+function updateUserUI(user) {
+  const avatar = document.getElementById('userAvatar');
+  const name   = document.getElementById('userName');
+  const logoutBtn = document.getElementById('logoutBtn');
+  if (user) {
+    if (user.photoURL) { avatar.src = user.photoURL; avatar.style.display = 'block'; }
+    name.textContent = user.displayName || user.email;
+    logoutBtn.style.display = 'flex';
+  } else {
+    avatar.style.display = 'none';
+    name.textContent = '';
+    logoutBtn.style.display = 'none';
+  }
+}
+
+// ─── GOOGLE SIGN-IN ───────────────────────────────────────────────────────────
+window.signInWithGoogle = async function() {
+  const btn = document.getElementById('googleSignInBtn');
+  btn.disabled = true; btn.textContent = 'Connexion…';
+  document.getElementById('authError').style.display = 'none';
+  try {
+    await signInWithPopup(auth, gProvider);
+  } catch(e) {
+    showAuthError('Erreur de connexion : ' + e.message);
+    btn.disabled = false; btn.innerHTML = '<img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="20">Continuer avec Google';
+  }
+};
+window.logout = async function() {
+  await signOut(auth);
+  showToast('Déconnecté.', 'info');
+};
+
+// ─── FIRESTORE ────────────────────────────────────────────────────────────────
+function initFirestore() {
+  setDbStatus('connecting');
+  const q = query(ticketsCol, orderBy('createdAt', 'asc'));
+  unsubscribe = onSnapshot(q, snap => {
+    tickets = snap.docs.map(d => ({ firestoreId: d.id, ...d.data() }));
+    renderTickets(tickets);
+    updateDashStats();
+    setDbStatus('connected');
+  }, err => {
+    setDbStatus('error');
+    showToast('Erreur Firestore : ' + err.message, 'error');
+  });
+}
+function setDbStatus(s) {
+  const el = document.getElementById('dbStatus'); if (!el) return;
+  const map = { connecting:{text:'⟳ Connexion…',color:'var(--yellow)'}, connected:{text:'● Firebase',color:'var(--green)'}, error:{text:'● Erreur DB',color:'var(--red)'} };
+  el.textContent = map[s].text; el.style.color = map[s].color;
+}
+async function fbAddTicket(t) {
+  await setDoc(doc(db, 'tickets', t.id), { id:t.id, name:t.name, email:t.email, category:t.category, status:'pending', entryTime:null, createdAt:serverTimestamp() });
+}
+async function fbUpdateTicket(id, data) {
+  const t = tickets.find(t => t.id === id); if (!t) return;
+  await updateDoc(doc(db, 'tickets', t.firestoreId || id), data);
+}
+async function fbDeleteTicket(id) {
+  const t = tickets.find(t => t.id === id); if (!t) return;
+  await deleteDoc(doc(db, 'tickets', t.firestoreId || id));
+}
+
+// ─── INIT DOM ─────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  setProvider('resend');
+  document.querySelectorAll('.modal-overlay').forEach(el => {
+    el.addEventListener('click', function(e) { if (e.target === this) this.classList.remove('open'); });
+  });
+});
+
+// ─── VIEWS ────────────────────────────────────────────────────────────────────
+window.switchView = function(v, btn) {
+  // Dashboard nécessite auth
+  if (v === 'dashboard' && !currentUser) {
+    showToast('Connectez-vous pour accéder au dashboard.', 'error');
+    document.getElementById('authOverlay').classList.add('open');
+    return;
+  }
+  document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('view-' + v).classList.add('active');
+  btn.classList.add('active');
+  if (v === 'dashboard') { renderTickets(tickets); updateDashStats(); }
+};
+
+// ─── CAMERA ───────────────────────────────────────────────────────────────────
+window.startCamera = async function() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'environment' } });
+    const video = document.getElementById('video'); video.srcObject = stream; await video.play();
+    document.getElementById('startBtn').style.display = 'none';
+    document.getElementById('stopBtn').style.display  = 'flex';
+    document.getElementById('noCam').style.display    = 'none';
+    document.getElementById('camStatus').textContent  = '● Actif';
+    document.getElementById('camStatus').style.color  = 'var(--green)';
+    scanning = true; requestAnimationFrame(scanFrame);
+  } catch(e) {
+    document.getElementById('noCam').style.display   = 'flex';
+    document.getElementById('video').style.display   = 'none';
+    document.getElementById('scanOverlay').style.display = 'none';
+    document.getElementById('camStatus').textContent = '● Indisponible';
+    document.getElementById('camStatus').style.color = 'var(--red)';
+    showToast('Caméra non accessible.', 'error');
+  }
+};
+window.stopCamera = function() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  scanning = false;
+  document.getElementById('startBtn').style.display = 'flex';
+  document.getElementById('stopBtn').style.display  = 'none';
+  document.getElementById('camStatus').textContent  = '● Arrêté';
+};
+function scanFrame() {
+  if (!scanning) return;
+  const video = document.getElementById('video'), canvas = document.getElementById('canvas');
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d'); ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const img  = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(img.data, img.width, img.height, { inversionAttempts:'dontInvert' });
+    if (code && code.data && !scanTimeout) {
+      processCode(code.data);
+      scanTimeout = setTimeout(() => { scanTimeout = null; }, 2500);
+    }
+  }
+  requestAnimationFrame(scanFrame);
+}
+
+// ─── VERIFY ───────────────────────────────────────────────────────────────────
+window.verifyManual = function() {
+  const code = document.getElementById('manualCode').value.trim().toUpperCase();
+  if (!code) { showToast('Entrez un code ticket.', 'error'); return; }
+  processCode(code); document.getElementById('manualCode').value = '';
+};
+async function processCode(code) {
+  stats.total++; document.getElementById('countTotal').textContent = stats.total;
+  const ticket = tickets.find(t => t.id.toUpperCase() === code.toUpperCase());
+  if (!ticket) {
+    stats.fail++; document.getElementById('countFail').textContent = stats.fail;
+    showResult('error','❌','Ticket invalide', code, 'Ce ticket n\'existe pas.', '');
+    logScan('fail','Inconnu — '+code, getTime()); showToast('Ticket non reconnu !','error'); playBeep(false); return;
+  }
+  if (ticket.status === 'entered') {
+    stats.fail++; document.getElementById('countFail').textContent = stats.fail;
+    showResult('warning','⚠️', ticket.name, ticket.id, 'Ticket déjà utilisé !', 'Entré à '+ticket.entryTime);
+    logScan('dup', ticket.name+' (doublon)', getTime()); showToast('Déjà utilisé — '+ticket.name,'error'); playBeep(false); return;
+  }
+  const t = getTime();
+  try {
+    await fbUpdateTicket(ticket.id, { status:'entered', entryTime:t });
+    stats.ok++; document.getElementById('countOk').textContent = stats.ok;
+    showResult('success','✅', ticket.name, ticket.id, categoryLabel(ticket.category), 'Heure d\'entrée : '+t);
+    logScan('ok', ticket.name, t); showToast('Bienvenue '+ticket.name+' !','success'); updateDashStats(); playBeep(true);
+  } catch(e) { showToast('Erreur mise à jour : '+e.message,'error'); }
+}
+function showResult(type,icon,name,ticketId,detail,time) {
+  const ids = ['resultDisplay','resultIcon','resultName','resultTicket','resultBadge','resultDetail','resultTime'];
+  const [d,i,n,t,b,det,tim] = ids.map(id => document.getElementById(id));
+  d.className='result-display '+type; i.className='result-icon '+type; i.textContent=icon;
+  n.textContent=name; n.style.color=type==='success'?'var(--green)':type==='error'?'var(--red)':'var(--yellow)';
+  t.textContent=ticketId; b.style.display='inline-block'; b.className='result-badge '+type;
+  b.textContent=type==='success'?'✓ ACCÈS AUTORISÉ':type==='error'?'✗ ACCÈS REFUSÉ':'⚠ DOUBLON';
+  det.textContent=detail; tim.textContent=time;
+}
+function logScan(type,name,time) {
+  const log=document.getElementById('scanLog');
+  const empty=log.querySelector('[data-empty]'); if(empty) empty.remove();
+  const item=document.createElement('div'); item.className='scan-item';
+  item.innerHTML=`<div class="scan-dot ${type}"></div><div class="scan-item-name">${name}</div><div class="scan-item-time">${time}</div>`;
+  log.insertBefore(item,log.firstChild);
+  if(log.children.length>20) log.removeChild(log.lastChild);
+}
+
+// ─── DASHBOARD ────────────────────────────────────────────────────────────────
+window.renderTickets = function(list) {
+  const tbody=document.getElementById('ticketsBody'); tbody.innerHTML='';
+  if(!list.length){ tbody.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:32px;">Aucun ticket — ajoutez-en un !</td></tr>'; return; }
+  list.forEach(t=>{
+    const catMap={vip:'badge-vip',premium:'badge-premium',standard:'badge-standard'};
+    const statusMap={entered:'status-entered',pending:'status-pending',invalid:'status-invalid'};
+    const statusLabel={entered:'● Entré',pending:'○ En attente',invalid:'✕ Invalide'};
+    const tr=document.createElement('tr');
+    tr.innerHTML=`
+      <td><span class="ticket-code">${t.id}</span></td>
+      <td><span class="ticket-name">${t.name}</span><br><span style="font-size:0.75rem;color:var(--text-muted)">${t.email}</span></td>
+      <td><span class="badge ${catMap[t.category]||'badge-standard'}">${t.category.toUpperCase()}</span></td>
+      <td><span class="status-badge ${statusMap[t.status]||'status-pending'}">${statusLabel[t.status]||'○ En attente'}</span></td>
+      <td style="color:var(--text-muted);font-size:0.82rem;">${t.entryTime||'—'}</td>
+      <td style="display:flex;gap:4px;flex-wrap:wrap;">
+        <button class="action-btn" onclick="sendQRFor('${t.id}')">✉</button>
+        <button class="action-btn" onclick="resetTicket('${t.id}')">Reset</button>
+        <button class="action-btn" style="color:var(--red);border-color:rgba(239,68,68,0.3);" onclick="deleteTicket('${t.id}')">✕</button>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+};
+window.filterTickets = function(q) {
+  const filtered=q?tickets.filter(t=>t.name.toLowerCase().includes(q.toLowerCase())||t.id.toLowerCase().includes(q.toLowerCase())||t.category.toLowerCase().includes(q.toLowerCase())):tickets;
+  renderTickets(filtered);
+};
+function updateDashStats() {
+  const total=tickets.length, entered=tickets.filter(t=>t.status==='entered').length,
+        pending=tickets.filter(t=>t.status==='pending').length, pct=total>0?Math.round((entered/total)*100):0;
+  document.getElementById('statTotal').textContent=total;
+  document.getElementById('statEntered').textContent=entered;
+  document.getElementById('statPending').textContent=pending;
+  document.getElementById('statInvalid').textContent=stats.fail;
+  document.getElementById('statPct').textContent=pct+'% du total';
+}
+window.resetTicket = async function(id) {
+  try { await fbUpdateTicket(id,{status:'pending',entryTime:null}); showToast('Ticket réinitialisé.','info'); }
+  catch(e){ showToast('Erreur : '+e.message,'error'); }
+};
+window.deleteTicket = async function(id) {
+  if(!confirm('Supprimer ce ticket définitivement ?')) return;
+  try { await fbDeleteTicket(id); showToast('Ticket supprimé.','info'); }
+  catch(e){ showToast('Erreur : '+e.message,'error'); }
+};
+
+// ─── ADD TICKET ───────────────────────────────────────────────────────────────
+window.openAddModal = function() {
+  document.getElementById('addModal').classList.add('open');
+  document.getElementById('qrPreviewArea').style.display='none';
+  document.getElementById('qrCanvasWrap').innerHTML='';
+  document.getElementById('fName').value='';
+  document.getElementById('fEmail').value='';
+  document.getElementById('fCategory').value='standard';
+  document.getElementById('createBtn').style.display='block';
+  document.getElementById('createBtn').disabled=false;
+  document.getElementById('createBtn').textContent='Créer le ticket';
+  currentTicket=null;
+};
+window.closeModal = function(id) { document.getElementById(id).classList.remove('open'); };
+window.addTicket = async function() {
+  const name=document.getElementById('fName').value.trim();
+  const email=document.getElementById('fEmail').value.trim();
+  const cat=document.getElementById('fCategory').value;
+  if(!name){ showToast('Le nom est requis.','error'); return; }
+  const btn=document.getElementById('createBtn'); btn.disabled=true; btn.textContent='Création…';
+  const id=generateId(name);
+  const t={id,name,email:email||'N/A',category:cat};
+  try {
+    await fbAddTicket(t); currentTicket={...t,status:'pending',entryTime:null};
+    document.getElementById('qrPreviewArea').style.display='block';
+    document.getElementById('qrTicketInfo').textContent=id+' — '+name;
+    renderQR(id,'qrCanvasWrap',180);
+    document.getElementById('eTo').value=email||'';
+    btn.style.display='none'; showToast('Ticket créé et sauvegardé ✓','success');
+  } catch(e){ showToast('Erreur Firebase : '+e.message,'error'); btn.disabled=false; btn.textContent='Créer le ticket'; }
+};
+function generateId(name) {
+  const parts=name.toUpperCase().replace(/[^A-Z]/g,'').slice(0,4).padEnd(4,'X');
+  const num=String(tickets.length+1).padStart(3,'0');
+  return `TK-2026-${num}-${parts}`;
+}
+
+// ─── QR ───────────────────────────────────────────────────────────────────────
+function renderQR(text,containerId,size) {
+  const wrap=document.getElementById(containerId); wrap.innerHTML='';
+  new QRCode(wrap,{text,width:size,height:size,colorDark:'#111118',colorLight:'#ffffff',correctLevel:QRCode.CorrectLevel.H});
+}
+function getQRDataURL(text,size) {
+  return new Promise(resolve=>{
+    const div=document.getElementById('hiddenQrWrap'); div.innerHTML='';
+    new QRCode(div,{text,width:size,height:size,colorDark:'#111118',colorLight:'#ffffff',correctLevel:QRCode.CorrectLevel.H});
+    setTimeout(()=>{
+      const img=div.querySelector('img')||div.querySelector('canvas');
+      if(img&&img.tagName==='IMG') resolve(img.src);
+      else if(img&&img.tagName==='CANVAS') resolve(img.toDataURL('image/png'));
+      else resolve(null);
+    },300);
+  });
+}
+window.downloadQR = function() {
+  if(!currentTicket){showToast('Aucun ticket.','error');return;}
+  const wrap=document.getElementById('qrCanvasWrap');
+  const img=wrap.querySelector('img')||wrap.querySelector('canvas');
+  if(!img){showToast('QR non disponible.','error');return;}
+  const src=img.tagName==='IMG'?img.src:img.toDataURL('image/png');
+  const a=document.createElement('a'); a.href=src; a.download=currentTicket.id+'-QR.png'; a.click();
+  showToast('QR téléchargé !','success');
+};
+
+// ─── EMAIL ────────────────────────────────────────────────────────────────────
+window.openEmailModal = function() {
+  if(!currentTicket){showToast('Créez d\'abord un ticket.','error');return;}
+  prefillEmail(currentTicket); document.getElementById('emailModal').classList.add('open');
+};
+window.sendQRFor = function(id) {
+  const t=tickets.find(t=>t.id===id); if(!t) return;
+  currentTicket=t; prefillEmail(t); document.getElementById('emailModal').classList.add('open');
+};
+function prefillEmail(t) {
+  document.getElementById('eTo').value=t.email!=='N/A'?t.email:'';
+  document.getElementById('eFrom').value='EventScan — Soirée Gala 2026';
+  document.getElementById('eFromEmail').value='noreply@ndawtech.com';
+  document.getElementById('eApiKey').value='';
+  document.getElementById('sendProgress').style.display='none';
+}
+window.setProvider = function(p) {
+  emailProvider=p;
+  document.getElementById('tabResend').classList.toggle('active',p==='resend');
+  document.getElementById('tabSendgrid').classList.toggle('active',p==='sendgrid');
+  document.getElementById('apiKeyLabel').textContent=p==='resend'?'Clé API Resend':'Clé API SendGrid';
+  document.getElementById('eApiKey').placeholder=p==='resend'?'re_xxxxxxxxxxxxxxxxxx':'SG.xxxxxxxxxxxxxxxxxx';
+  document.getElementById('apiInfoBox').innerHTML=p==='resend'
+    ?'Domaine vérifié : <strong style="color:var(--violet-light)">ndawtech.com</strong>. Expéditeur : <strong>noreply@ndawtech.com</strong>'
+    :'Clé API sur <a href="https://app.sendgrid.com/settings/api_keys" target="_blank">app.sendgrid.com</a>';
+};
+window.sendEmail = async function() {
+  const to=document.getElementById('eTo').value.trim(), fromName=document.getElementById('eFrom').value.trim()||'EventScan',
+        fromEmail=document.getElementById('eFromEmail').value.trim(), apiKey=document.getElementById('eApiKey').value.trim();
+  if(!to){showToast('Email destinataire requis.','error');return;}
+  if(!apiKey){showToast('Clé API requise.','error');return;}
+  if(!fromEmail){showToast('Email expéditeur requis.','error');return;}
+  if(!currentTicket){showToast('Aucun ticket sélectionné.','error');return;}
+  const prog=document.getElementById('sendProgress'); prog.style.display='flex';
+  document.getElementById('sendProgressText').textContent='Génération du QR…';
+  const qrDataUrl=await getQRDataURL(currentTicket.id,200);
+  document.getElementById('sendProgressText').textContent='Envoi en cours…';
+  const catEmoji={vip:'⭐',premium:'💎',standard:'🎫'}[currentTicket.category]||'🎫';
+  const htmlBody=`<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#0A0A0F;font-family:Inter,Arial,sans-serif;"><div style="max-width:520px;margin:0 auto;padding:32px 20px;"><div style="background:#111118;border:1px solid rgba(124,58,237,0.25);border-radius:20px;overflow:hidden;"><div style="background:linear-gradient(135deg,#7C3AED,#A78BFA);padding:28px 32px;text-align:center;"><div style="font-size:2rem;margin-bottom:8px;">${catEmoji}</div><h1 style="color:white;font-size:1.5rem;margin:0;font-weight:800;">Votre ticket d'entrée</h1><div style="color:rgba(255,255,255,0.7);font-size:0.9rem;margin-top:6px;">Soirée Gala 2026</div></div><div style="padding:28px 32px;"><div style="margin-bottom:16px;"><div style="font-size:0.75rem;color:#9CA3AF;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Invité(e)</div><div style="font-size:1.2rem;font-weight:700;color:#F5F5F5;">${currentTicket.name}</div></div><div style="margin-bottom:16px;"><div style="font-size:0.75rem;color:#9CA3AF;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Code ticket</div><div style="font-size:0.9rem;font-family:monospace;color:#A78BFA;font-weight:600;">${currentTicket.id}</div></div><div style="margin-bottom:16px;"><div style="font-size:0.75rem;color:#9CA3AF;margin-bottom:4px;">Catégorie</div><div style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:0.8rem;font-weight:700;background:rgba(124,58,237,0.2);color:#A78BFA;border:1px solid rgba(124,58,237,0.3);">${currentTicket.category.toUpperCase()}</div></div><div style="text-align:center;padding:20px;background:#1A1A24;border-radius:12px;margin:20px 0;"><div style="font-size:0.8rem;color:#9CA3AF;margin-bottom:14px;">Présentez ce QR code à l'entrée</div>${qrDataUrl?`<img src="${qrDataUrl}" style="border-radius:8px;display:block;margin:0 auto;" width="180" height="180" alt="QR Code">`:'<div style="color:#9CA3AF;">'+currentTicket.id+'</div>'}</div><div style="font-size:0.78rem;color:#6B7280;text-align:center;line-height:1.5;">Ce ticket est personnel et nominatif.<br>Généré par <strong style="color:#A78BFA;">EventScan</strong> — ndawtech.com</div></div></div></div></body></html>`;
+  try {
+    let response;
+    if(emailProvider==='resend') response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{'Authorization':'Bearer '+apiKey,'Content-Type':'application/json'},body:JSON.stringify({from:fromName+' <'+fromEmail+'>',to:[to],subject:'🎟️ Votre ticket — '+currentTicket.name+' ['+currentTicket.id+']',html:htmlBody})});
+    else response=await fetch('https://api.sendgrid.com/v3/mail/send',{method:'POST',headers:{'Authorization':'Bearer '+apiKey,'Content-Type':'application/json'},body:JSON.stringify({personalizations:[{to:[{email:to}]}],from:{email:fromEmail,name:fromName},subject:'🎟️ Votre ticket — '+currentTicket.name,content:[{type:'text/html',value:htmlBody}]})});
+    prog.style.display='none';
+    if(response.ok||(emailProvider==='sendgrid'&&response.status===202)){showToast('Email envoyé à '+to+' ✓','success');closeModal('emailModal');}
+    else{const err=await response.json().catch(()=>({}));showToast('Erreur : '+(err.message||err.errors?.[0]?.message||'status '+response.status),'error');}
+  } catch(e){prog.style.display='none';showToast('Erreur réseau : '+e.message,'error');}
+};
+
+// ─── EXPORT EXCEL ─────────────────────────────────────────────────────────────
+window.exportExcel = function() {
+  showExportOverlay('Génération Excel…','Préparation des données');
+  setTimeout(()=>{
+    const data=tickets.map(t=>({'Code Ticket':t.id,'Nom':t.name,'Email':t.email,'Catégorie':t.category.toUpperCase(),'Statut':t.status==='entered'?'Entré':t.status==='pending'?'En attente':'Invalide',"Heure d'entrée":t.entryTime||'—'}));
+    const ws=XLSX.utils.json_to_sheet(data); ws['!cols']=[{wch:22},{wch:22},{wch:28},{wch:12},{wch:14},{wch:14}];
+    const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,'Tickets');
+    const summary=[['Rapport EventScan',''],['Événement','Soirée Gala 2026'],['Date export',new Date().toLocaleString('fr-FR')],['Total',tickets.length],['Entrés',tickets.filter(t=>t.status==='entered').length],['En attente',tickets.filter(t=>t.status==='pending').length],['Invalides',stats.fail]];
+    const ws2=XLSX.utils.aoa_to_sheet(summary); ws2['!cols']=[{wch:20},{wch:25}]; XLSX.utils.book_append_sheet(wb,ws2,'Résumé');
+    XLSX.writeFile(wb,'EventScan_'+new Date().toISOString().slice(0,10)+'.xlsx');
+    hideExportOverlay(); showToast('Export Excel téléchargé ✓','success');
+  },400);
+};
+
+// ─── EXPORT PDF ───────────────────────────────────────────────────────────────
+window.exportPDF = async function() {
+  showExportOverlay('Génération PDF…','Création du rapport');
+  await new Promise(r=>setTimeout(r,300));
+  try {
+    const {jsPDF}=window.jspdf; const doc=new jsPDF({orientation:'portrait',unit:'mm',format:'a4'});
+    const W=210,margin=18;
+    doc.setFillColor(10,10,15); doc.rect(0,0,W,297,'F');
+    doc.setFillColor(124,58,237); doc.rect(0,0,W,28,'F');
+    doc.setFont('helvetica','bold'); doc.setFontSize(18); doc.setTextColor(255,255,255);
+    doc.text('EventScan — Rapport d\'accès',margin,18);
+    doc.setFontSize(9); doc.setTextColor(200,180,255);
+    doc.text('Soirée Gala 2026  ·  '+new Date().toLocaleString('fr-FR'),W-margin,18,{align:'right'});
+    const total=tickets.length,entered=tickets.filter(t=>t.status==='entered').length,pending=tickets.filter(t=>t.status==='pending').length;
+    const boxes=[{label:'Total',val:total,col:[124,58,237]},{label:'Entrés',val:entered,col:[16,185,129]},{label:'En attente',val:pending,col:[245,158,11]},{label:'Invalides',val:stats.fail,col:[239,68,68]}];
+    boxes.forEach((b,i)=>{const x=margin+i*(44);doc.setFillColor(...b.col,40);doc.roundedRect(x,35,40,18,3,3,'F');doc.setDrawColor(...b.col);doc.setLineWidth(0.5);doc.roundedRect(x,35,40,18,3,3,'S');doc.setFont('helvetica','bold');doc.setFontSize(16);doc.setTextColor(...b.col);doc.text(String(b.val),x+20,46,{align:'center'});doc.setFont('helvetica','normal');doc.setFontSize(7);doc.setTextColor(156,163,175);doc.text(b.label,x+20,51,{align:'center'});});
+    let y=62; const cols=[['Code Ticket',46],['Nom',44],['Catégorie',24],['Statut',26],['Heure',24]];
+    doc.setFillColor(26,26,36); doc.rect(margin,y,W-2*margin,8,'F');
+    let x=margin; doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(156,163,175);
+    cols.forEach(([label,w])=>{doc.text(label.toUpperCase(),x+2,y+5.5);x+=w;}); y+=8;
+    tickets.forEach((t,idx)=>{
+      if(y>272){doc.addPage();doc.setFillColor(10,10,15);doc.rect(0,0,W,297,'F');y=18;}
+      doc.setFillColor(idx%2===0?17:22,idx%2===0?17:22,idx%2===0?24:30);doc.rect(margin,y,W-2*margin,8,'F');
+      x=margin;doc.setFont('courier','normal');doc.setFontSize(7);doc.setTextColor(167,139,250);doc.text(t.id,x+2,y+5.5);x+=46;
+      doc.setFont('helvetica','bold');doc.setTextColor(245,245,245);doc.text(t.name.slice(0,22),x+2,y+5.5);x+=44;
+      const catCol={vip:[167,139,250],premium:[245,158,11],standard:[156,163,175]}[t.category]||[156,163,175];
+      doc.setFont('helvetica','bold');doc.setTextColor(...catCol);doc.text(t.category.toUpperCase(),x+2,y+5.5);x+=24;
+      const stCol=t.status==='entered'?[16,185,129]:t.status==='pending'?[156,163,175]:[239,68,68];
+      doc.setFont('helvetica','bold');doc.setTextColor(...stCol);doc.text(t.status==='entered'?'Entré':t.status==='pending'?'En attente':'Invalide',x+2,y+5.5);x+=26;
+      doc.setFont('helvetica','normal');doc.setTextColor(156,163,175);doc.text(t.entryTime||'—',x+2,y+5.5);y+=8;
+    });
+    doc.setFillColor(124,58,237);doc.rect(0,290,W,7,'F');
+    doc.setFont('helvetica','normal');doc.setFontSize(7);doc.setTextColor(200,180,255);
+    doc.text('Généré par EventScan • ndawtech.com',W/2,295,{align:'center'});
+    doc.save('EventScan_Rapport_'+new Date().toISOString().slice(0,10)+'.pdf');
+    hideExportOverlay(); showToast('Export PDF téléchargé ✓','success');
+  } catch(e){hideExportOverlay();showToast('Erreur PDF : '+e.message,'error');}
+};
+function showExportOverlay(label,sub){document.getElementById('exportLabel').textContent=label;document.getElementById('exportSub').textContent=sub;document.getElementById('exportOverlay').classList.add('open');}
+function hideExportOverlay(){document.getElementById('exportOverlay').classList.remove('open');}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+function categoryLabel(cat){return{vip:'⭐ VIP',premium:'💎 Premium',standard:'🎫 Standard'}[cat]||cat;}
+function getTime(){return new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+function showToast(msg,type){
+  const t=document.getElementById('toast');t.className='toast '+type;
+  t.innerHTML=(type==='success'?'✅':type==='error'?'❌':'ℹ️')+' '+msg;
+  t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3500);
+}
+window.showToast=showToast;
+function playBeep(success){
+  try{const ctx=new(window.AudioContext||window.webkitAudioContext)(),o=ctx.createOscillator(),g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.frequency.value=success?880:330;o.type=success?'sine':'square';g.gain.setValueAtTime(0.3,ctx.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+(success?0.3:0.5));o.start(ctx.currentTime);o.stop(ctx.currentTime+0.5);}catch(e){}
+}
+</script>
+<style>
+:root{--bg:#0A0A0F;--bg2:#111118;--bg3:#1A1A24;--violet:#7C3AED;--violet-light:#A78BFA;--green:#10B981;--red:#EF4444;--yellow:#F59E0B;--text:#F5F5F5;--text-muted:#9CA3AF;--border:rgba(124,58,237,0.25);--card:rgba(255,255,255,0.04);}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
+
+/* ── AUTH OVERLAY ── */
+.auth-overlay{position:fixed;inset:0;background:var(--bg);z-index:500;display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity 0.3s;}
+.auth-overlay.open{opacity:1;pointer-events:all;}
+.auth-card{background:var(--bg2);border:1px solid var(--border);border-radius:24px;padding:48px 40px;width:400px;max-width:92vw;display:flex;flex-direction:column;align-items:center;gap:0;}
+.auth-logo{font-family:'Syne',sans-serif;font-size:2rem;font-weight:800;margin-bottom:6px;}
+.auth-logo span{color:var(--violet-light);}
+.auth-tagline{font-size:0.85rem;color:var(--text-muted);margin-bottom:36px;text-align:center;}
+.auth-divider{width:100%;border:none;border-top:1px solid var(--border);margin:28px 0;}
+.auth-section-label{font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:var(--text-muted);margin-bottom:16px;align-self:flex-start;}
+.google-btn{width:100%;display:flex;align-items:center;justify-content:center;gap:12px;padding:14px 20px;background:white;color:#1f1f1f;border:none;border-radius:12px;font-family:'Inter',sans-serif;font-weight:600;font-size:0.95rem;cursor:pointer;transition:all 0.2s;box-shadow:0 2px 8px rgba(0,0,0,0.3);}
+.google-btn:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(0,0,0,0.4);}
+.google-btn:disabled{opacity:0.6;cursor:not-allowed;transform:none;}
+.google-btn img{width:20px;height:20px;}
+.auth-error{width:100%;margin-top:16px;padding:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:10px;color:var(--red);font-size:0.82rem;display:none;text-align:center;}
+.auth-scanner-note{margin-top:20px;padding:14px 16px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:10px;font-size:0.8rem;color:var(--green);text-align:center;width:100%;}
+.auth-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(124,58,237,0.12);border:1px solid rgba(124,58,237,0.25);border-radius:20px;padding:5px 14px;font-size:0.78rem;color:var(--violet-light);margin-bottom:32px;}
+
+/* ── HEADER ── */
+header{display:flex;align-items:center;justify-content:space-between;padding:16px 28px;background:rgba(10,10,15,0.95);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);}
+.logo{font-family:'Syne',sans-serif;font-size:1.4rem;font-weight:800;letter-spacing:-0.5px;}
+.logo span{color:var(--violet-light);}
+.nav-tabs{display:flex;gap:4px;background:var(--bg3);border-radius:10px;padding:4px;border:1px solid var(--border);}
+.nav-tab{padding:8px 20px;border-radius:7px;cursor:pointer;font-size:0.85rem;font-weight:600;color:var(--text-muted);border:none;background:transparent;transition:all 0.2s;}
+.nav-tab.active{background:var(--violet);color:white;}
+.nav-tab.protected{position:relative;}
+.nav-tab.protected::after{content:'🔒';font-size:0.65rem;position:absolute;top:4px;right:4px;}
+.header-right{display:flex;align-items:center;gap:10px;}
+.db-badge{display:flex;align-items:center;gap:7px;font-size:0.78rem;background:var(--card);border:1px solid var(--border);padding:6px 14px;border-radius:20px;}
+.user-area{display:flex;align-items:center;gap:8px;}
+#userAvatar{width:30px;height:30px;border-radius:50%;border:2px solid var(--violet);display:none;object-fit:cover;}
+#userName{font-size:0.8rem;font-weight:600;color:var(--text-muted);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.logout-btn{display:none;align-items:center;gap:6px;padding:6px 14px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.25);border-radius:8px;color:var(--red);font-size:0.78rem;font-weight:600;cursor:pointer;font-family:'Inter',sans-serif;transition:all 0.2s;}
+.logout-btn:hover{background:rgba(239,68,68,0.2);}
+.event-badge{display:flex;align-items:center;gap:8px;font-size:0.82rem;color:var(--text-muted);background:var(--card);border:1px solid var(--border);padding:6px 14px;border-radius:20px;}
+.event-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 1.5s infinite;}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.3)}}
+
+/* ── VIEWS ── */
+.view{display:none;}.view.active{display:block;}
+
+/* ── SCANNER ── */
+.scanner-layout{display:grid;grid-template-columns:1fr 380px;gap:24px;padding:28px;max-width:1200px;margin:0 auto;}
+.scanner-card{background:var(--bg2);border:1px solid var(--border);border-radius:20px;overflow:hidden;display:flex;flex-direction:column;}
+.scanner-header{padding:20px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;}
+.scanner-title{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:700;}
+.scanner-status{font-size:0.78rem;font-weight:600;padding:4px 12px;border-radius:20px;background:rgba(16,185,129,0.15);color:var(--green);border:1px solid rgba(16,185,129,0.3);}
+.scanner-area{flex:1;position:relative;background:#000;min-height:400px;display:flex;align-items:center;justify-content:center;}
+#video{width:100%;height:100%;object-fit:cover;display:block;}#canvas{display:none;}
+.scan-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;}
+.scan-frame{width:220px;height:220px;position:relative;}
+.scan-frame::before,.scan-frame::after{content:'';position:absolute;width:30px;height:30px;border-color:var(--violet-light);border-style:solid;}
+.scan-frame::before{top:0;left:0;border-width:3px 0 0 3px;border-radius:4px 0 0 0;}
+.scan-frame::after{top:0;right:0;border-width:3px 3px 0 0;border-radius:0 4px 0 0;}
+.scan-frame-bl::before,.scan-frame-bl::after{content:'';position:absolute;width:30px;height:30px;border-color:var(--violet-light);border-style:solid;}
+.scan-frame-bl::before{bottom:0;left:0;border-width:0 0 3px 3px;border-radius:0 0 0 4px;}
+.scan-frame-bl::after{bottom:0;right:0;border-width:0 3px 3px 0;border-radius:0 0 4px 0;}
+.scan-laser{position:absolute;left:10px;right:10px;height:2px;background:linear-gradient(90deg,transparent,var(--violet),var(--violet-light),var(--violet),transparent);box-shadow:0 0 10px var(--violet);animation:laserScan 2s ease-in-out infinite;top:10px;}
+@keyframes laserScan{0%,100%{top:10px;opacity:0.8;}50%{top:calc(100% - 12px);opacity:1;}}
+.scanner-no-cam{display:flex;flex-direction:column;align-items:center;gap:16px;color:var(--text-muted);padding:40px;text-align:center;}
+.scanner-no-cam svg{opacity:0.3;}
+.scanner-controls{padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;}
+.btn{flex:1;padding:12px 18px;border-radius:10px;font-family:'Inter',sans-serif;font-weight:600;font-size:0.88rem;cursor:pointer;border:none;transition:all 0.2s;}
+.btn-primary{background:var(--violet);color:white;}.btn-primary:hover{background:#6d28d9;transform:translateY(-1px);}
+.btn-secondary{background:var(--card);color:var(--text-muted);border:1px solid var(--border);}.btn-secondary:hover{border-color:var(--violet-light);color:var(--text);}
+.manual-input-area{padding:16px 24px;border-top:1px solid var(--border);}
+.manual-label{font-size:0.78rem;color:var(--text-muted);margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;}
+.manual-row{display:flex;gap:8px;}
+.manual-input{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text);font-family:'Inter',sans-serif;font-size:0.9rem;outline:none;transition:border-color 0.2s;}.manual-input:focus{border-color:var(--violet);}
+.btn-verify{padding:10px 18px;background:var(--violet);color:white;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:0.85rem;transition:background 0.2s;}.btn-verify:hover{background:#6d28d9;}
+.result-panel{background:var(--bg2);border:1px solid var(--border);border-radius:20px;display:flex;flex-direction:column;overflow:hidden;}
+.result-header{padding:20px 24px;border-bottom:1px solid var(--border);font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;}
+.result-display{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 24px;min-height:280px;transition:background 0.4s;}
+.result-display.idle{background:var(--bg2);}.result-display.success{background:rgba(16,185,129,0.06);}.result-display.error{background:rgba(239,68,68,0.06);}.result-display.warning{background:rgba(245,158,11,0.06);}
+.result-icon{width:80px;height:80px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:2.2rem;margin-bottom:20px;transition:all 0.3s;}
+.result-icon.idle{background:var(--bg3);}.result-icon.success{background:rgba(16,185,129,0.15);border:2px solid var(--green);box-shadow:0 0 30px rgba(16,185,129,0.2);}.result-icon.error{background:rgba(239,68,68,0.15);border:2px solid var(--red);box-shadow:0 0 30px rgba(239,68,68,0.2);}.result-icon.warning{background:rgba(245,158,11,0.15);border:2px solid var(--yellow);box-shadow:0 0 30px rgba(245,158,11,0.2);}
+.result-name{font-family:'Syne',sans-serif;font-size:1.5rem;font-weight:800;text-align:center;margin-bottom:6px;}
+.result-ticket{font-size:0.82rem;color:var(--text-muted);font-family:'Inter',monospace;margin-bottom:16px;letter-spacing:0.5px;}
+.result-badge{font-size:0.9rem;font-weight:700;padding:8px 20px;border-radius:20px;letter-spacing:0.3px;}
+.result-badge.success{background:rgba(16,185,129,0.15);color:var(--green);border:1px solid rgba(16,185,129,0.3);}
+.result-badge.error{background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);}
+.result-badge.warning{background:rgba(245,158,11,0.15);color:var(--yellow);border:1px solid rgba(245,158,11,0.3);}
+.result-detail{font-size:0.8rem;color:var(--text-muted);margin-top:8px;text-align:center;}.result-time{font-size:0.76rem;color:var(--text-muted);margin-top:4px;}
+.mini-stats{display:grid;grid-template-columns:1fr 1fr 1fr;border-top:1px solid var(--border);}
+.mini-stat{padding:16px;text-align:center;border-right:1px solid var(--border);}.mini-stat:last-child{border-right:none;}
+.mini-stat-val{font-family:'Syne',sans-serif;font-size:1.5rem;font-weight:800;}
+.mini-stat-val.green{color:var(--green);}.mini-stat-val.red{color:var(--red);}.mini-stat-val.violet{color:var(--violet-light);}
+.mini-stat-label{font-size:0.72rem;color:var(--text-muted);margin-top:2px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;}
+.recent-scans{padding:16px 24px;border-top:1px solid var(--border);}
+.recent-label{font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin-bottom:12px;}
+.scan-log{display:flex;flex-direction:column;gap:6px;max-height:180px;overflow-y:auto;}
+.scan-log::-webkit-scrollbar{width:4px;}.scan-log::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+.scan-item{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg3);border-radius:8px;font-size:0.82rem;}
+.scan-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}.scan-dot.ok{background:var(--green);}.scan-dot.fail{background:var(--red);}.scan-dot.dup{background:var(--yellow);}
+.scan-item-name{flex:1;font-weight:600;}.scan-item-time{color:var(--text-muted);font-size:0.76rem;}
+
+/* ── DASHBOARD ── */
+.dash-layout{padding:28px;max-width:1200px;margin:0 auto;display:flex;flex-direction:column;gap:24px;}
+.dash-top{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
+.dash-title{font-family:'Syne',sans-serif;font-size:1.6rem;font-weight:800;}.dash-title span{color:var(--violet-light);}
+.dash-actions{display:flex;gap:10px;flex-wrap:wrap;}
+.btn-add{display:flex;align-items:center;gap:8px;padding:10px 20px;background:var(--violet);color:white;border:none;border-radius:10px;font-family:'Inter',sans-serif;font-weight:600;font-size:0.88rem;cursor:pointer;transition:all 0.2s;white-space:nowrap;}.btn-add:hover{background:#6d28d9;transform:translateY(-1px);}
+.btn-export{display:flex;align-items:center;gap:8px;padding:10px 18px;background:var(--card);color:var(--text-muted);border:1px solid var(--border);border-radius:10px;font-family:'Inter',sans-serif;font-weight:600;font-size:0.85rem;cursor:pointer;transition:all 0.2s;white-space:nowrap;}
+.btn-export.green:hover{border-color:var(--green);color:var(--green);}.btn-export.red:hover{border-color:var(--red);color:var(--red);}
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;}
+.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:20px;display:flex;flex-direction:column;gap:8px;transition:border-color 0.2s;}.stat-card:hover{border-color:var(--violet);}
+.stat-icon{font-size:1.4rem;width:44px;height:44px;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--bg3);margin-bottom:4px;}
+.stat-val{font-family:'Syne',sans-serif;font-size:2rem;font-weight:800;line-height:1;}
+.stat-label{font-size:0.82rem;color:var(--text-muted);font-weight:500;}.stat-change{font-size:0.76rem;color:var(--green);font-weight:600;}
+.section-card{background:var(--bg2);border:1px solid var(--border);border-radius:20px;overflow:hidden;}
+.section-header{display:flex;align-items:center;justify-content:space-between;padding:20px 24px;border-bottom:1px solid var(--border);gap:12px;flex-wrap:wrap;}
+.section-title{font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;}
+.search-input{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 14px;color:var(--text);font-family:'Inter',sans-serif;font-size:0.85rem;outline:none;width:220px;transition:border-color 0.2s;}.search-input:focus{border-color:var(--violet);}
+.tickets-table{width:100%;border-collapse:collapse;}
+.tickets-table th{font-size:0.75rem;text-transform:uppercase;letter-spacing:0.6px;color:var(--text-muted);font-weight:700;padding:12px 24px;text-align:left;border-bottom:1px solid var(--border);background:var(--bg3);}
+.tickets-table td{padding:14px 24px;font-size:0.88rem;border-bottom:1px solid rgba(255,255,255,0.04);}
+.tickets-table tr:last-child td{border-bottom:none;}.tickets-table tr:hover td{background:var(--card);}
+.ticket-code{font-family:'Inter',monospace;font-size:0.8rem;color:var(--violet-light);font-weight:600;}.ticket-name{font-weight:600;}
+.badge{display:inline-block;font-size:0.75rem;font-weight:700;padding:3px 10px;border-radius:20px;}
+.badge-vip{background:rgba(124,58,237,0.2);color:var(--violet-light);border:1px solid rgba(124,58,237,0.3);}
+.badge-standard{background:var(--bg3);color:var(--text-muted);border:1px solid var(--border);}
+.badge-premium{background:rgba(245,158,11,0.15);color:var(--yellow);border:1px solid rgba(245,158,11,0.3);}
+.status-badge{display:inline-flex;align-items:center;gap:5px;font-size:0.78rem;font-weight:700;padding:4px 10px;border-radius:20px;}
+.status-entered{background:rgba(16,185,129,0.12);color:var(--green);}.status-pending{background:rgba(255,255,255,0.05);color:var(--text-muted);}.status-invalid{background:rgba(239,68,68,0.1);color:var(--red);}
+.action-btn{padding:6px 12px;background:var(--card);border:1px solid var(--border);border-radius:7px;color:var(--text-muted);font-size:0.8rem;font-weight:600;cursor:pointer;transition:all 0.2s;font-family:'Inter',sans-serif;}.action-btn:hover{border-color:var(--violet);color:var(--violet-light);}
+
+/* ── MODALS ── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:200;opacity:0;pointer-events:none;transition:opacity 0.2s;backdrop-filter:blur(4px);}
+.modal-overlay.open{opacity:1;pointer-events:all;}
+.modal{background:var(--bg2);border:1px solid var(--border);border-radius:20px;padding:32px;width:500px;max-width:92vw;max-height:90vh;overflow-y:auto;transform:scale(0.95);transition:transform 0.2s;}
+.modal-overlay.open .modal{transform:scale(1);}
+.modal-title{font-family:'Syne',sans-serif;font-size:1.2rem;font-weight:800;margin-bottom:24px;}
+.form-group{margin-bottom:16px;}.form-label{font-size:0.8rem;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin-bottom:6px;display:block;}
+.form-input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:11px 14px;color:var(--text);font-family:'Inter',sans-serif;font-size:0.9rem;outline:none;transition:border-color 0.2s;}.form-input:focus{border-color:var(--violet);}
+.form-select{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:11px 14px;color:var(--text);font-family:'Inter',sans-serif;font-size:0.9rem;outline:none;cursor:pointer;}
+.modal-actions{display:flex;gap:10px;margin-top:24px;}.modal-actions .btn{flex:1;padding:13px;}
+.qr-display{display:flex;flex-direction:column;align-items:center;gap:10px;padding:20px 16px;background:var(--bg3);border-radius:12px;margin-top:12px;border:1px solid var(--border);}
+#qrCanvasWrap canvas,#qrCanvasWrap img{border-radius:8px;display:block;}
+.qr-ticket-info{text-align:center;font-size:0.8rem;color:var(--text-muted);}
+.qr-actions{display:flex;gap:8px;margin-top:4px;}
+.qr-actions button{padding:7px 16px;border-radius:7px;font-size:0.8rem;font-weight:600;cursor:pointer;border:1px solid var(--border);background:var(--card);color:var(--text-muted);font-family:'Inter',sans-serif;transition:all 0.2s;}.qr-actions button:hover{border-color:var(--violet-light);color:var(--text);}
+.provider-tabs{display:flex;gap:6px;margin-bottom:16px;}
+.provider-tab{padding:7px 16px;border-radius:7px;font-size:0.82rem;font-weight:600;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text-muted);font-family:'Inter',sans-serif;transition:all 0.2s;}.provider-tab.active{background:var(--violet);color:white;border-color:var(--violet);}
+.email-section{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:16px;margin-top:8px;}
+.email-section-title{font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin-bottom:8px;}
+.info-box{font-size:0.78rem;color:var(--text-muted);background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.2);border-radius:8px;padding:10px 12px;margin-top:8px;line-height:1.5;}.info-box a{color:var(--violet-light);}
+.send-progress{display:none;align-items:center;gap:10px;margin-top:12px;padding:10px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;font-size:0.82rem;color:var(--green);}
+.spinner{width:16px;height:16px;border:2px solid rgba(16,185,129,0.3);border-top-color:var(--green);border-radius:50%;animation:spin 0.7s linear infinite;flex-shrink:0;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* ── TOAST ── */
+.toast{position:fixed;bottom:28px;right:28px;padding:14px 22px;border-radius:12px;font-weight:600;font-size:0.88rem;z-index:600;transform:translateY(80px);opacity:0;transition:all 0.35s cubic-bezier(.17,.67,.35,1);display:flex;align-items:center;gap:10px;max-width:360px;}
+.toast.show{transform:translateY(0);opacity:1;}
+.toast.success{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.4);color:var(--green);}
+.toast.error{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.4);color:var(--red);}
+.toast.info{background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.4);color:var(--violet-light);}
+
+/* ── EXPORT OVERLAY ── */
+.export-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:250;opacity:0;pointer-events:none;transition:opacity 0.2s;backdrop-filter:blur(4px);}
+.export-overlay.open{opacity:1;pointer-events:all;}
+.export-card{background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:32px 40px;text-align:center;display:flex;flex-direction:column;gap:16px;align-items:center;min-width:260px;}
+.export-spinner{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--violet);border-radius:50%;animation:spin 0.8s linear infinite;}
+.export-label{font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;}.export-sub{font-size:0.82rem;color:var(--text-muted);}
+
+@media(max-width:900px){.scanner-layout{grid-template-columns:1fr;}.stats-row{grid-template-columns:1fr 1fr;}header{padding:12px 16px;}.scanner-layout,.dash-layout{padding:16px;}.nav-tab{padding:7px 12px;font-size:0.8rem;}#userName{display:none;}.event-badge{display:none;}}
+@media(max-width:600px){.stats-row{grid-template-columns:1fr 1fr;}.tickets-table th,.tickets-table td{padding:10px 12px;}.dash-actions{width:100%;}.btn-add,.btn-export{flex:1;justify-content:center;}}
+</style>
+</head>
+<body>
+
+<!-- ═══ AUTH OVERLAY ═══ -->
+<div class="auth-overlay open" id="authOverlay">
+  <div class="auth-card">
+    <div class="auth-logo">Event<span>Scan</span></div>
+    <div class="auth-tagline">Plateforme de contrôle d'accès événementiel</div>
+    <div class="auth-badge">🔒 Espace sécurisé — Administrateurs</div>
+
+    <div class="auth-section-label">Connexion administrateur</div>
+    <button class="google-btn" id="googleSignInBtn" onclick="signInWithGoogle()">
+      <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="20" alt="Google">
+      Continuer avec Google
+    </button>
+    <div class="auth-error" id="authError"></div>
+
+    <hr class="auth-divider">
+
+    <div class="auth-scanner-note">
+      📷 Le scanner d'entrée est accessible sans connexion.<br>
+      Seul le dashboard admin est protégé.
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MAIN APP ═══ -->
+<div id="mainApp" style="display:none;">
+
+<header>
+  <div class="logo">Event<span>Scan</span></div>
+  <div class="nav-tabs">
+    <button class="nav-tab active" onclick="switchView('scanner',this)">📷 Scanner</button>
+    <button class="nav-tab protected" onclick="switchView('dashboard',this)">📊 Dashboard</button>
+  </div>
+  <div class="header-right">
+    <div class="db-badge">
+      <div style="width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 1.5s infinite;"></div>
+      <span id="dbStatus" style="color:var(--yellow);font-size:0.78rem;">⟳ Connexion…</span>
+    </div>
+    <div class="user-area">
+      <img id="userAvatar" src="" alt="avatar">
+      <span id="userName"></span>
+      <button class="logout-btn" id="logoutBtn" onclick="logout()">⏻ Déconnexion</button>
+    </div>
+    <div class="event-badge"><div class="event-dot"></div><span>Soirée Gala 2026</span></div>
+  </div>
+</header>
+
+<!-- SCANNER VIEW -->
+<div class="view active" id="view-scanner">
+  <div class="scanner-layout">
+    <div class="scanner-card">
+      <div class="scanner-header">
+        <div class="scanner-title">📷 Caméra de scan</div>
+        <div class="scanner-status" id="camStatus">● Prêt</div>
+      </div>
+      <div class="scanner-area">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="canvas"></canvas>
+        <div class="scan-overlay" id="scanOverlay">
+          <div class="scan-frame"><div class="scan-frame-bl"></div><div class="scan-laser"></div></div>
+        </div>
+        <div class="scanner-no-cam" id="noCam" style="display:none;">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="6" width="20" height="15" rx="2"/><path d="M8 6V4h8v2"/><circle cx="12" cy="13" r="3"/></svg>
+          <div><div style="font-weight:600;margin-bottom:4px;">Caméra non disponible</div><div style="font-size:0.8rem;">Utilisez la saisie manuelle</div></div>
+        </div>
+      </div>
+      <div class="scanner-controls">
+        <button class="btn btn-primary" id="startBtn" onclick="startCamera()">▶ Démarrer la caméra</button>
+        <button class="btn btn-secondary" id="stopBtn" onclick="stopCamera()" style="display:none;">⏹ Arrêter</button>
+      </div>
+      <div class="manual-input-area">
+        <div class="manual-label">Saisie manuelle du code ticket</div>
+        <div class="manual-row">
+          <input class="manual-input" id="manualCode" type="text" placeholder="ex: TK-2026-001-ABCD" onkeydown="if(event.key==='Enter')verifyManual()">
+          <button class="btn-verify" onclick="verifyManual()">Vérifier</button>
+        </div>
+      </div>
+    </div>
+    <div class="result-panel">
+      <div class="result-header">Résultat du scan</div>
+      <div class="result-display idle" id="resultDisplay">
+        <div class="result-icon idle" id="resultIcon">🎫</div>
+        <div class="result-name" id="resultName" style="color:var(--text-muted);font-size:1rem;">En attente d'un scan</div>
+        <div class="result-ticket" id="resultTicket">—</div>
+        <div class="result-badge" id="resultBadge" style="display:none;"></div>
+        <div class="result-detail" id="resultDetail"></div>
+        <div class="result-time" id="resultTime"></div>
+      </div>
+      <div class="mini-stats">
+        <div class="mini-stat"><div class="mini-stat-val green" id="countOk">0</div><div class="mini-stat-label">Entrées</div></div>
+        <div class="mini-stat"><div class="mini-stat-val red" id="countFail">0</div><div class="mini-stat-label">Refusés</div></div>
+        <div class="mini-stat"><div class="mini-stat-val violet" id="countTotal">0</div><div class="mini-stat-label">Scans</div></div>
+      </div>
+      <div class="recent-scans">
+        <div class="recent-label">Derniers scans</div>
+        <div class="scan-log" id="scanLog">
+          <div data-empty style="font-size:0.8rem;color:var(--text-muted);text-align:center;padding:16px;">Aucun scan pour l'instant</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- DASHBOARD VIEW -->
+<div class="view" id="view-dashboard">
+  <div class="dash-layout">
+    <div class="dash-top">
+      <div class="dash-title">Tableau de bord — <span>Soirée Gala 2026</span></div>
+      <div class="dash-actions">
+        <button class="btn-export green" onclick="exportExcel()">⬇ Excel</button>
+        <button class="btn-export red" onclick="exportPDF()">⬇ PDF</button>
+        <button class="btn-add" onclick="openAddModal()">+ Ajouter un ticket</button>
+      </div>
+    </div>
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-icon">🎟️</div><div class="stat-val" id="statTotal">0</div><div class="stat-label">Tickets total</div></div>
+      <div class="stat-card"><div class="stat-icon">✅</div><div class="stat-val" id="statEntered" style="color:var(--green)">0</div><div class="stat-label">Entrés</div><div class="stat-change" id="statPct">0%</div></div>
+      <div class="stat-card"><div class="stat-icon">⏳</div><div class="stat-val" id="statPending" style="color:var(--yellow)">0</div><div class="stat-label">En attente</div></div>
+      <div class="stat-card"><div class="stat-icon">❌</div><div class="stat-val" id="statInvalid" style="color:var(--red)">0</div><div class="stat-label">Invalides / Dup</div></div>
+    </div>
+    <div class="section-card">
+      <div class="section-header">
+        <div class="section-title">Liste des tickets <span style="font-size:0.75rem;color:var(--green);font-weight:500;margin-left:8px;">● Temps réel Firebase</span></div>
+        <input class="search-input" type="text" placeholder="🔍 Rechercher..." oninput="filterTickets(this.value)">
+      </div>
+      <div style="overflow-x:auto;">
+        <table class="tickets-table">
+          <thead><tr><th>Code ticket</th><th>Invité</th><th>Catégorie</th><th>Statut</th><th>Heure d'entrée</th><th>Actions</th></tr></thead>
+          <tbody id="ticketsBody"><tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:32px;">Connexion Firebase…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /mainApp -->
+
+<!-- ADD TICKET MODAL -->
+<div class="modal-overlay" id="addModal">
+  <div class="modal">
+    <div class="modal-title">➕ Nouveau ticket</div>
+    <div class="form-group"><label class="form-label">Nom de l'invité</label><input class="form-input" id="fName" type="text" placeholder="Prénom Nom"></div>
+    <div class="form-group"><label class="form-label">Email</label><input class="form-input" id="fEmail" type="email" placeholder="email@exemple.com"></div>
+    <div class="form-group"><label class="form-label">Catégorie</label><select class="form-select" id="fCategory"><option value="standard">Standard</option><option value="premium">Premium</option><option value="vip">VIP</option></select></div>
+    <div id="qrPreviewArea" style="display:none;">
+      <div class="qr-display">
+        <div id="qrCanvasWrap"></div>
+        <div class="qr-ticket-info" id="qrTicketInfo"></div>
+        <div class="qr-actions">
+          <button onclick="downloadQR()">⬇ Télécharger QR</button>
+          <button onclick="openEmailModal()">✉ Envoyer par email</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('addModal')">Fermer</button>
+      <button class="btn btn-primary" id="createBtn" onclick="addTicket()">Créer le ticket</button>
+    </div>
+  </div>
+</div>
+
+<!-- EMAIL MODAL -->
+<div class="modal-overlay" id="emailModal">
+  <div class="modal">
+    <div class="modal-title">✉ Envoyer le ticket par email</div>
+    <div class="provider-tabs">
+      <button class="provider-tab active" id="tabResend" onclick="setProvider('resend')">Resend</button>
+      <button class="provider-tab" id="tabSendgrid" onclick="setProvider('sendgrid')">SendGrid</button>
+    </div>
+    <div class="form-group"><label class="form-label">Destinataire</label><input class="form-input" id="eTo" type="email" placeholder="invite@exemple.com"></div>
+    <div class="form-group"><label class="form-label">Nom expéditeur</label><input class="form-input" id="eFrom" type="text" value="EventScan — Soirée Gala 2026"></div>
+    <div class="form-group"><label class="form-label">Email expéditeur</label><input class="form-input" id="eFromEmail" type="email" value="noreply@ndawtech.com"></div>
+    <div class="email-section">
+      <div class="email-section-title" id="apiKeyLabel">Clé API Resend</div>
+      <input class="form-input" id="eApiKey" type="password" placeholder="re_xxxxxxxxxxxxxxxxxx">
+      <div class="info-box" id="apiInfoBox">Domaine vérifié : <strong style="color:var(--violet-light)">ndawtech.com</strong>. Expéditeur : <strong>noreply@ndawtech.com</strong></div>
+    </div>
+    <div class="send-progress" id="sendProgress"><div class="spinner"></div><span id="sendProgressText">Envoi en cours…</span></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('emailModal')">Annuler</button>
+      <button class="btn btn-primary" onclick="sendEmail()">📨 Envoyer</button>
+    </div>
+  </div>
+</div>
+
+<div class="export-overlay" id="exportOverlay">
+  <div class="export-card"><div class="export-spinner"></div><div class="export-label" id="exportLabel">Génération…</div><div class="export-sub" id="exportSub">Merci de patienter</div></div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div id="hiddenQrWrap" style="position:fixed;left:-9999px;top:-9999px;"></div>
+</body>
+</html>
