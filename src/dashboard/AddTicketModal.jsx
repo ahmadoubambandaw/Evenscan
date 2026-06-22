@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { createTicket } from '../tickets/ticketsApi.js';
+import { createTicket, sendTicketEmail } from '../tickets/ticketsApi.js';
 import { generateTicketId } from '../tickets/generateId.js';
 import QRPreview from './QRPreview.jsx';
 
@@ -10,6 +10,8 @@ export default function AddTicketModal({ open, onClose, existingIds }) {
   const [creating, setCreating] = useState(false);
   const [createdTicket, setCreatedTicket] = useState(null);
   const [error, setError] = useState(null);
+  const [sending, setSending] = useState(false);
+  const [sendStatus, setSendStatus] = useState(null);
 
   function reset() {
     setName('');
@@ -17,6 +19,8 @@ export default function AddTicketModal({ open, onClose, existingIds }) {
     setCategory('standard');
     setCreatedTicket(null);
     setError(null);
+    setSending(false);
+    setSendStatus(null);
   }
 
   function handleClose() {
@@ -34,8 +38,9 @@ export default function AddTicketModal({ open, onClose, existingIds }) {
     setError(null);
     try {
       const id = generateTicketId(name, existingIds);
-      await createTicket({ id, name: name.trim(), email: email.trim(), category });
-      setCreatedTicket({ id, name: name.trim(), category });
+      const cleanEmail = email.trim();
+      await createTicket({ id, name: name.trim(), email: cleanEmail, category });
+      setCreatedTicket({ id, name: name.trim(), category, email: cleanEmail });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -43,7 +48,23 @@ export default function AddTicketModal({ open, onClose, existingIds }) {
     }
   }
 
+  async function handleSendEmail() {
+    if (!createdTicket) return;
+    setSending(true);
+    setSendStatus(null);
+    try {
+      await sendTicketEmail(createdTicket.id);
+      setSendStatus({ ok: true, message: 'Email envoyé.' });
+    } catch (err) {
+      setSendStatus({ ok: false, message: err.message });
+    } finally {
+      setSending(false);
+    }
+  }
+
   if (!open) return null;
+
+  const hasEmail = Boolean(createdTicket?.email) && createdTicket.email !== 'N/A';
 
   return (
     <div className="modal-overlay open" onClick={(e) => e.target === e.currentTarget && handleClose()}>
@@ -86,6 +107,18 @@ export default function AddTicketModal({ open, onClose, existingIds }) {
         ) : (
           <div>
             <QRPreview ticketId={createdTicket.id} ticketName={createdTicket.name} />
+            {hasEmail ? (
+              <div className="send-email-block">
+                <button type="button" onClick={handleSendEmail} disabled={sending}>
+                  {sending ? 'Envoi…' : '✉ Envoyer le billet par email'}
+                </button>
+                {sendStatus && (
+                  <p className={sendStatus.ok ? 'form-success' : 'form-error'}>{sendStatus.message}</p>
+                )}
+              </div>
+            ) : (
+              <p className="form-hint">Aucun email renseigné — billet à transmettre manuellement.</p>
+            )}
             <div className="modal-actions">
               <button type="button" onClick={handleClose}>
                 Fermer

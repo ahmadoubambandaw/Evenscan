@@ -9,9 +9,11 @@ import {
   setDoc,
   updateDoc,
 } from 'firebase/firestore';
-import { db } from '../firebase.js';
+import { httpsCallable } from 'firebase/functions';
+import { db, functions } from '../firebase.js';
 
 const ticketsCol = collection(db, 'tickets');
+const sendTicketEmailCallable = httpsCallable(functions, 'sendTicketEmail');
 
 export function subscribeTickets(onChange, onError) {
   const q = query(ticketsCol, orderBy('createdAt', 'asc'));
@@ -51,4 +53,12 @@ export async function resetTicket(ticketId) {
 
 export async function deleteTicket(ticketId) {
   await deleteDoc(doc(db, 'tickets', ticketId));
+}
+
+// Appelle la Cloud Function sendTicketEmail : la génération du QR et la
+// clé API du fournisseur d'email restent côté serveur, jamais dans le
+// navigateur.
+export async function sendTicketEmail(ticketId) {
+  const result = await sendTicketEmailCallable({ ticketId });
+  return result.data;
 }

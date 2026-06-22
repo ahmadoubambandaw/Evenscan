@@ -17,8 +17,9 @@ référence pendant la migration.
 3. ✅ Règles Firestore définitives (scanner vs dashboard)
 4. ✅ Scanner QR (caméra + saisie manuelle), compatible Android/iPhone
 5. ✅ Dashboard (liste des tickets, stats, recherche, CRUD)
-6. ⬜ Génération de QR + envoi d'email via une fonction serveur (la clé
-   API du fournisseur d'email ne doit plus être saisie dans le navigateur)
+6. ✅ Génération de QR + envoi d'email via une fonction serveur (Cloud
+   Functions) — la clé API du fournisseur d'email n'est plus jamais
+   saisie ni exposée dans le navigateur
 7. ⬜ Export Excel / PDF
 
 ## Modèle d'accès
@@ -35,14 +36,14 @@ le document Firestore `meta/access` :
 ```
 
 - **admin** : accès complet (dashboard, créer/modifier/supprimer des
-  tickets, export).
+  tickets, export, envoi d'emails).
 - **agent** : scanner uniquement — peut lire les tickets et mettre à jour
   *seulement* `status` et `entryTime` (impossible de créer, supprimer, ou
   modifier le nom/email/catégorie d'un ticket). Appliqué côté serveur par
   `firestore.rules`, pas seulement côté UI.
 
 ⚠️ Les emails dans `admins`/`agents` doivent être en minuscules (les
-règles comparent l'email du token en minuscules).
+règles et la Cloud Function comparent l'email du token en minuscules).
 
 ### Amorçage (premier déploiement)
 
@@ -79,9 +80,10 @@ de :
 
 - voir les stats en temps réel (total, entrés, en attente) ;
 - rechercher un ticket (nom, code, catégorie) ;
-- créer un ticket (aperçu + téléchargement du QR) ;
+- créer un ticket (aperçu + téléchargement du QR, envoi par email) ;
 - modifier nom/email/catégorie d'un ticket existant ;
-- réinitialiser ou supprimer un ticket.
+- réinitialiser ou supprimer un ticket ;
+- renvoyer le billet par email à tout moment depuis la liste (icône ✉).
 
 L'identifiant de ticket est généré avec un suffixe aléatoire vérifié
 contre les tickets déjà chargés (`src/tickets/generateId.js`), à la
@@ -95,6 +97,47 @@ dans le dashboard pour ne pas afficher un chiffre faux — un vrai journal
 de scans persisté dans Firestore pourra être ajouté plus tard si ce
 suivi est nécessaire.
 
+## Email — fonction serveur (Cloud Functions)
+
+Dans l'ancienne version, la clé API du fournisseur d'email (Resend/
+SendGrid) était saisie directement dans le navigateur — n'importe qui
+ouvrant les outils de dev pouvait la voler. C'est désormais corrigé :
+
+- `functions/index.js` expose une Cloud Function **callable**
+  `sendTicketEmail({ ticketId })`.
+- La fonction vérifie que l'appelant est connecté **et** listé dans
+  `meta/access.admins` (même règle que le dashboard) avant de faire
+  quoi que ce soit.
+- Elle régénère le QR côté serveur (`qrcode` côté Node) et l'envoie en
+  pièce jointe via l'API Resend, en utilisant une *clé secrète Cloud
+  Functions* — jamais une variable `VITE_*`, donc jamais dans le bundle
+  client.
+- En cas de succès, le ticket Firestore reçoit un champ `emailSentAt`
+  (affiché comme ✓ dans le dashboard, ce qui permet de savoir qui a déjà
+  reçu son billet sans relancer un envoi par erreur).
+
+### Configuration
+
+```bash
+cd functions
+npm install
+
+# Clé API Resend (ou autre fournisseur compatible), stockée comme secret
+# Cloud Functions — jamais en clair dans le repo.
+firebase functions:secrets:set RESEND_API_KEY
+
+# Optionnel : adresse d'expéditeur personnalisée (sinon valeur par défaut
+# de test Resend). Pour la 2e génération de Cloud Functions, cela se
+# configure via un fichier functions/.env (non commité, voir .gitignore) :
+#   EMAIL_FROM="EventScan <billets@tondomaine.com>"
+
+firebase deploy --only functions
+```
+
+Le domaine d'envoi (`EMAIL_FROM`) doit être vérifié côté Resend pour ne
+pas finir en spam ; en attendant, la valeur par défaut `onboarding@
+resend.dev` fonctionne pour les tests.
+
 ## Développement
 
 ```bash
@@ -107,7 +150,8 @@ npm run dev
 
 Voir `.env.example`. Toutes les clés sont préfixées `VITE_` pour être
 exposées au build Vite côté client (config Firebase publique standard,
-pas de secret serveur ici).
+pas de secret serveur ici — la clé email, elle, vit uniquement dans
+`functions/` côté serveur, voir section ci-dessus).
 
 ## Build
 
