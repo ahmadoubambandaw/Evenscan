@@ -6,9 +6,9 @@ par email).
 
 ## État du projet
 
-Le projet a été reconstruit en React (Vite) pour remplacer l'ancien
-fichier unique `eventscan.html`, conservé temporairement comme
-référence.
+Application React (Vite) complète : authentification Google, rôles
+admin/agent, scanner QR caméra + saisie manuelle, dashboard temps réel,
+envoi d'email côté serveur, export Excel/PDF.
 
 Étapes :
 
