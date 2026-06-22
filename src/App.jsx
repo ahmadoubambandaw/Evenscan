@@ -1,5 +1,6 @@
 import { AuthProvider, useAuth } from './auth/AuthContext.jsx';
 import SignIn from './auth/SignIn.jsx';
+import ScannerView from './scanner/ScannerView.jsx';
 
 function Shell() {
   const { user, role, loading, logOut } = useAuth();
@@ -30,10 +31,7 @@ function Shell() {
         </div>
       </header>
       <main className="app-main">
-        <p>
-          Connecté en tant que <strong>{role}</strong>. Le scanner QR et le
-          dashboard arrivent aux étapes suivantes de la migration.
-        </p>
+        <ScannerView />
       </main>
     </div>
   );
