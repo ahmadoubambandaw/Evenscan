@@ -16,7 +16,7 @@ référence pendant la migration.
 2. ✅ Authentification Google + modèle de rôles (admin / agent)
 3. ✅ Règles Firestore définitives (scanner vs dashboard)
 4. ✅ Scanner QR (caméra + saisie manuelle), compatible Android/iPhone
-5. ⬜ Dashboard (liste des tickets, stats, recherche, CRUD)
+5. ✅ Dashboard (liste des tickets, stats, recherche, CRUD)
 6. ⬜ Génération de QR + envoi d'email via une fonction serveur (la clé
    API du fournisseur d'email ne doit plus être saisie dans le navigateur)
 7. ⬜ Export Excel / PDF
@@ -71,6 +71,29 @@ quelques contraintes :
 - En cas de refus de permission ou d'absence de caméra, l'app affiche
   un message adapté (instructions iPhone vs Android) et la saisie
   manuelle reste toujours disponible en repli.
+
+## Dashboard
+
+Réservé aux admins (l'onglet n'apparaît même pas pour un agent). Permet
+de :
+
+- voir les stats en temps réel (total, entrés, en attente) ;
+- rechercher un ticket (nom, code, catégorie) ;
+- créer un ticket (aperçu + téléchargement du QR) ;
+- modifier nom/email/catégorie d'un ticket existant ;
+- réinitialiser ou supprimer un ticket.
+
+L'identifiant de ticket est généré avec un suffixe aléatoire vérifié
+contre les tickets déjà chargés (`src/tickets/generateId.js`), à la
+place du compteur `tickets.length + 1` de l'ancienne version qui pouvait
+produire des doublons en cas de créations concurrentes.
+
+**Limite connue** : le compteur "invalides/doublons" de l'ancienne
+version était une variable JS locale, perdue au rechargement et jamais
+partagée entre plusieurs postes de scan. Je ne l'ai pas repris en l'état
+dans le dashboard pour ne pas afficher un chiffre faux — un vrai journal
+de scans persisté dans Firestore pourra être ajouté plus tard si ce
+suivi est nécessaire.
 
 ## Développement
 
