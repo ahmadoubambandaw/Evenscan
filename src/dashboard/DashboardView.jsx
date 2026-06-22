@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { subscribeTickets, deleteTicket, resetTicket } from '../tickets/ticketsApi.js';
+import { exportTicketsToExcel, exportTicketsToPdf } from '../tickets/exportTickets.js';
 import StatsRow from './StatsRow.jsx';
 import TicketsTable from './TicketsTable.jsx';
 import AddTicketModal from './AddTicketModal.jsx';
@@ -30,9 +31,25 @@ export default function DashboardView() {
     <div className="dash-layout">
       <div className="dash-top">
         <h2>Tableau de bord</h2>
-        <button className="btn-add" onClick={() => setAddOpen(true)}>
-          + Ajouter un ticket
-        </button>
+        <div className="dash-top-actions">
+          <button
+            className="btn-export"
+            onClick={() => exportTicketsToExcel(tickets)}
+            disabled={tickets.length === 0}
+          >
+            📊 Export Excel
+          </button>
+          <button
+            className="btn-export"
+            onClick={() => exportTicketsToPdf(tickets)}
+            disabled={tickets.length === 0}
+          >
+            📄 Export PDF
+          </button>
+          <button className="btn-add" onClick={() => setAddOpen(true)}>
+            + Ajouter un ticket
+          </button>
+        </div>
       </div>
       {dbError && <p className="db-error">Erreur Firestore : {dbError}</p>}
       <StatsRow tickets={tickets} />

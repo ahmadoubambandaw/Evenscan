@@ -6,11 +6,11 @@ par email).
 
 ## État du projet
 
-Le projet est en cours de reconstruction en React (Vite) pour remplacer
-l'ancien fichier unique `eventscan.html`, conservé temporairement comme
-référence pendant la migration.
+Le projet a été reconstruit en React (Vite) pour remplacer l'ancien
+fichier unique `eventscan.html`, conservé temporairement comme
+référence.
 
-Étapes prévues :
+Étapes :
 
 1. ✅ Structure du projet (squelette React/Vite, config d'environnement)
 2. ✅ Authentification Google + modèle de rôles (admin / agent)
@@ -20,7 +20,7 @@ référence pendant la migration.
 6. ✅ Génération de QR + envoi d'email via une fonction serveur (Cloud
    Functions) — la clé API du fournisseur d'email n'est plus jamais
    saisie ni exposée dans le navigateur
-7. ⬜ Export Excel / PDF
+7. ✅ Export Excel / PDF de la liste des tickets
 
 ## Modèle d'accès
 
@@ -83,7 +83,9 @@ de :
 - créer un ticket (aperçu + téléchargement du QR, envoi par email) ;
 - modifier nom/email/catégorie d'un ticket existant ;
 - réinitialiser ou supprimer un ticket ;
-- renvoyer le billet par email à tout moment depuis la liste (icône ✉).
+- renvoyer le billet par email à tout moment depuis la liste (icône ✉) ;
+- exporter la liste complète en Excel ou PDF (boutons en haut du
+  dashboard).
 
 L'identifiant de ticket est généré avec un suffixe aléatoire vérifié
 contre les tickets déjà chargés (`src/tickets/generateId.js`), à la
@@ -96,6 +98,19 @@ partagée entre plusieurs postes de scan. Je ne l'ai pas repris en l'état
 dans le dashboard pour ne pas afficher un chiffre faux — un vrai journal
 de scans persisté dans Firestore pourra être ajouté plus tard si ce
 suivi est nécessaire.
+
+## Export Excel / PDF
+
+`src/tickets/exportTickets.js` génère, côté navigateur (pas de fonction
+serveur nécessaire ici, aucune donnée sensible n'est impliquée) :
+
+- un fichier `.xlsx` (via `xlsx`) avec une ligne par ticket (code, nom,
+  email, catégorie, statut, heure d'entrée) ;
+- un fichier `.pdf` (via `jspdf` + `jspdf-autotable`) avec un tableau
+  équivalent et un en-tête horodaté.
+
+L'export porte sur la liste complète des tickets chargés (indépendant du
+filtre de recherche du tableau).
 
 ## Email — fonction serveur (Cloud Functions)
 
@@ -157,4 +172,11 @@ pas de secret serveur ici — la clé email, elle, vit uniquement dans
 
 ```bash
 npm run build
+```
+
+## Déploiement
+
+```bash
+npm run build
+firebase deploy --only hosting,firestore:rules,functions
 ```
