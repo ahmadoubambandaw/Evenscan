@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// Modèle d'accès :
+// - meta/access contient deux tableaux d'emails en minuscules : admins, agents
+// - admin  : accès complet aux tickets (création, lecture, mise à jour, suppression)
+// - agent  : scanner uniquement — lecture des tickets + mise à jour des seuls
+//            champs status/entryTime (pas de création, pas de suppression,
+//            pas de modification du nom/email/catégorie)
+//
+// Amorçage : le premier document meta/access doit être créé manuellement
+// dans la console Firebase (voir README) avant la première connexion.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email != null;
+    }
+
+    function userEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    function accessDoc() {
+      return get(/databases/$(database)/documents/meta/access).data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && userEmail() in accessDoc().admins;
+    }
+
+    function isAgent() {
+      return isSignedIn() && userEmail() in accessDoc().agents;
+    }
+
+    function isStaff() {
+      return isAdmin() || isAgent();
+    }
+
+    function onlyUpdatingScanFields() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'entryTime']);
+    }
+
+    match /meta/access {
+      // Lecture ouverte à tout utilisateur connecté pour que l'app puisse
+      // déterminer "non autorisé" sans erreur de permission. Écriture
+      // réservée aux admins.
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /tickets/{ticketId} {
+      allow read: if isStaff();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (isAgent() && onlyUpdatingScanFields());
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
