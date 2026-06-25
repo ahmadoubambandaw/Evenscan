@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Scanner from './Scanner.jsx';
 import ManualEntry from './ManualEntry.jsx';
 import ScanResult from './ScanResult.jsx';
@@ -29,11 +29,14 @@ export default function ScannerView() {
     );
   }, []);
 
-  function pushLog(type, name) {
+  const pushLog = useCallback((type, name) => {
     setLog((l) => [{ type, name, time: getTime() }, ...l].slice(0, 20));
-  }
+  }, []);
 
-  async function handleCode(rawCode) {
+  // useCallback évite de recréer la fonction à chaque render (setResult /
+  // setStats / setLog provoquent des re-renders) ce qui sinon annulerait et
+  // relancerait la boucle RAF du scanner à chaque scan.
+  const handleCode = useCallback(async (rawCode) => {
     const code = rawCode.trim().toUpperCase();
     setStats((s) => ({ ...s, total: s.total + 1 }));
     const ticket = ticketsRef.current.find((t) => t.id.toUpperCase() === code);
@@ -67,7 +70,7 @@ export default function ScannerView() {
     } catch (e) {
       setResult({ type: 'error', name: 'Erreur', code: ticket.id, detail: e.message });
     }
-  }
+  }, [pushLog]);
 
   return (
     <div className="scanner-layout">
