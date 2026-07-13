@@ -1,8 +1,12 @@
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { AuthProvider, useAuth } from './auth/AuthContext.jsx';
 import SignIn from './auth/SignIn.jsx';
 import ScannerView from './scanner/ScannerView.jsx';
-import DashboardView from './dashboard/DashboardView.jsx';
+
+// Chargement différé : jspdf + xlsx (~1 Mo) ne sont téléchargés que quand
+// un admin ouvre le dashboard, pas pour les agents qui n'utilisent que
+// le scanner.
+const DashboardView = lazy(() => import('./dashboard/DashboardView.jsx'));
 
 function Shell() {
   const { user, role, loading, logOut } = useAuth();
@@ -45,7 +49,15 @@ function Shell() {
           <button onClick={logOut}>Déconnexion</button>
         </div>
       </header>
-      <main className="app-main">{view === 'dashboard' && isAdmin ? <DashboardView /> : <ScannerView />}</main>
+      <main className="app-main">
+        {view === 'dashboard' && isAdmin ? (
+          <Suspense fallback={<div className="centered">Chargement du dashboard…</div>}>
+            <DashboardView />
+          </Suspense>
+        ) : (
+          <ScannerView />
+        )}
+      </main>
     </div>
   );
 }

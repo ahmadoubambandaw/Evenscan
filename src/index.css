@@ -1,3 +1,9 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
 :root {
   font-family: 'Inter', system-ui, sans-serif;
   color-scheme: dark;
@@ -51,6 +57,11 @@ body {
   color: #1f1f1f;
   font-weight: 600;
   cursor: pointer;
+}
+
+.google-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
 }
 
 .auth-error {
